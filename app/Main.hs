@@ -1,7 +1,6 @@
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE PolymorphicComponents #-}
 {-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE FlexibleInstances #-}
-
 {-# OPTIONS_GHC -Wall #-}
 
 module Main where
@@ -10,10 +9,12 @@ import Control.Applicative
 import Control.Monad
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Maybe
+import Data.Map (Map)
+import qualified Data.Map as Map
 import Data.Bifunctor
 import Data.Char
-import GHC.Float
 import System.Console.Readline
+import Control.Monad.Trans.State
 
 newtype ParseError = ParseError {runParseError :: [String]}
   deriving (Show)
@@ -33,7 +34,7 @@ newtype Parser s a = Parser
 runParser :: Parser s a -> s -> Either ParseError a
 runParser p s = unParser p s (const . Right) (const . Left)
 
-runParserGetUnparsed :: Parser s a -> s -> Either (ParseError, s) (a,s)
+runParserGetUnparsed :: Parser s a -> s -> Either (ParseError, s) (a, s)
 runParserGetUnparsed p s = unParser p s (curry Right) (curry Left)
 
 -- Does not consume or perform side effects !
@@ -47,7 +48,13 @@ notFollowedBy p = Parser $ \s ok err ->
 parseError :: [Char] -> Parser s a
 parseError msg = Parser $ \s _ err -> err (ParseError [msg]) s
 
-instance Show s => Monad (Parser s) where
+instance Semigroup a => Semigroup (Parser s a) where
+  p <> q = do
+    x <- p
+    y <- q
+    return $ x <> y
+
+instance Monad (Parser s) where
   return a = Parser $ \s ok _ -> ok a s
   p >>= f = parserBind p f
 
@@ -56,22 +63,22 @@ parserBind p f = Parser $ \s ok err ->
   let new_ok a s2 = unParser (f a) s2 ok err
    in unParser p s new_ok err
 
-instance Show s => Applicative (Parser s) where
+instance Applicative (Parser s) where
   pure = return
   (<*>) = Control.Monad.ap
 
-instance Show s => Functor (Parser s) where
+instance Functor (Parser s) where
   fmap f p = parserMap f p
 
-instance Show s => Alternative (Parser s) where
+instance Alternative (Parser s) where
   empty = parseError "Unknown error"
   (<|>) = mplus
 
-instance Show s => MonadPlus (Parser s) where
+instance MonadPlus (Parser s) where
   mzero = empty
   mplus m n = parserPlus m n
 
-parserPlus :: Show s => Parser s a -> Parser s a -> Parser s a
+parserPlus :: Parser s a -> Parser s a -> Parser s a
 parserPlus m n = Parser $ \s ok err ->
   let new_err _ _ = unParser n s ok err
    in unParser m s ok new_err
@@ -81,7 +88,7 @@ parserPlus m n = Parser $ \s ok err ->
 --   case runParser p s of
 --     Left _ -> err (ParseError []) s
 --     Right a -> ok a s
--- 
+--
 
 parserMap :: (a -> b) -> Parser s a -> Parser s b
 parserMap f p = Parser $ \s ok err ->
@@ -114,18 +121,19 @@ lookAhead p =
 
 eof :: Show a => Parser [a] ()
 eof = eof' <|> (till eof' >>= \x -> parseError ("Expected end of file, found " ++ show x))
-  where eof' = notFollowedBy consumeOne
+  where
+    eof' = notFollowedBy consumeOne
 
-(<?>) :: Show s => Parser s a -> [Char] -> Parser s a
+(<?>) :: Parser s a -> [Char] -> Parser s a
 p <?> msg = p <|> parseError msg
 
 optionnal :: (Alternative f, Monad f) => f (Maybe a) -> f (Maybe a)
 optionnal p = p <|> return Nothing
 
-consumeMaybe :: Show s => Parser s a -> Parser s (Maybe a)
+consumeMaybe :: Parser s a -> Parser s (Maybe a)
 consumeMaybe = fmap Just
 
-liftMaybe :: Show s => Maybe a -> Parser s a
+liftMaybe :: Maybe a -> Parser s a
 liftMaybe = maybe (parseError "Can't lift from Maybe") return
 
 satisfy :: Show a => (a -> Bool) -> Parser [a] a
@@ -134,13 +142,16 @@ satisfy f = do
   if f c then return () else parseError $ "Unexpected character " ++ show c
   return c
 
-char :: (Show a, Eq a) => a -> Parser [a] ()
-char = void . satisfy . (==)
+char :: (Show a, Eq a) => a -> Parser [a] a
+char = satisfy . (==)
 
-digit :: Parser [Char] Int
-digit = (digitToInt <$> satisfy isDigit) <?> "Awaited digit"
+digit :: Parser [Char] Integer
+digit = (toInteger . digitToInt<$> satisfy isDigit) <?> "Awaited digit"
 
-naturalNumber :: Parser [Char] Int
+alphaNum :: Parser [Char] Char
+alphaNum = satisfy isAlphaNum
+
+naturalNumber :: Parser [Char] Integer
 naturalNumber = do
   s <- some digit
   return $ foldl (\x y -> 10 * x + y) 0 s
@@ -148,30 +159,11 @@ naturalNumber = do
 nothing :: Parser [Char] a
 nothing = return undefined
 
-between :: Applicative f => f a1 -> f b -> f a2 -> f a2
-between a b p = a *> p <* b
-
 -- Parse sign, returns +1 if + or nothing is found, -1 else
-sign :: Parser String Int
+sign :: Parser String Integer
 sign = (char '-' >> return (-1)) <|> ((char '+' <|> nothing) >> return 1)
 
-integer :: Parser String Int
-integer = do
-  s <- sign
-  n <- naturalNumber
-  return $ s * n
-
-float :: Parser String Float
-float = do
-  s <- sign
-  n <- naturalNumber
-
-  f <-
-    (char '.' >> many digit >>= \d -> return $ foldl (\x y -> (x + int2Float y) / 10.0) 0.0 (reverse d))
-      <|> return 0.0
-  return $ int2Float (s * n) + f
-
-integralNumber :: Parser String Int
+integralNumber :: Parser String Integer
 integralNumber = do
   -- starts with - or (exclusive) starts with +
   s <- sign
@@ -182,61 +174,53 @@ integralNumber = do
 data SExpr
   = PlaceHolder
   | Paren SExpr
+  | Identifier String
   | Biop String SExpr SExpr
   | UnaryOp String SExpr
-  | Number Int
+  | Number Integer
   deriving (Show)
 
 data SToken
-  = TokNum Int
+  = TokNum Integer
+  | TokDebug Char
+  | TokIdentifier String
   | TokOp String
   | TokParenOpen
   | TokParenClose
   deriving (Show, Eq)
 
-maybeTokNum :: SToken -> Maybe Int
-maybeTokNum (TokNum n) = Just n
-maybeTokNum _ = Nothing
-
-maybeTokOp :: SToken -> Maybe String
-maybeTokOp (TokOp op) = Just op
-maybeTokOp _ = Nothing
-
-tokParenOpen :: SToken -> Bool
-tokParenOpen TokParenOpen = True
-tokParenOpen _ = False
-
-tokParenClose :: SToken -> Bool
-tokParenClose TokParenClose = True
-tokParenClose _ = False
-
 oneOf :: [Parser String String] -> Parser String String
 oneOf = foldl (<|>) mzero
 
-till :: Show a => Parser [a] b -> Parser [a] [a]
-till p = (lookAhead p >> return [])
+till :: Parser [a] b -> Parser [a] [a]
+till p =
+  (lookAhead p >> return [])
     <|> do
-          x <- consumeOne
-          xs <- till p
-          return $ x : xs
+      x <- consumeOne
+      xs <- till p
+      return $ x : xs
 
 whitespace :: Parser [Char] ()
-whitespace = char ' ' <|> char '\t' <|> char '\n'
+whitespace = void $ char ' ' <|> char '\t' <|> char '\n'
 
 whitespaces :: Parser [Char] ()
 whitespaces = void (many whitespace)
 
 toTokens :: Parser [Char] [SToken]
-toTokens = some aToken <* eof
+toTokens = ((:[]) <$> debugToken <|> return []) <> (whitespaces *> many aToken <* eof)
   where
-    aToken = (number <|> operator <|> paren) <* whitespaces
+    debugToken = char ':' >> TokDebug <$> consumeOne
+    aToken = (number <|> identifier <|> operator <|> paren) <* whitespaces
     number = TokNum <$> naturalNumber
-    operator = TokOp <$> oneOf [token "+", token "-", token "*", token "/", token "^"]
+    identifier = TokIdentifier <$> some alphaNum
+    operator = TokOp <$> oneOf [token "+", token "-", token "*", token "/", token "^", token "="]
     paren = (char '(' >> return TokParenOpen) <|> (char ')' >> return TokParenClose)
 
 hasGreaterPrecedence :: [Char] -> [Char] -> Bool
 hasGreaterPrecedence a b = precedence a > precedence b
   where
+    precedence :: String -> Integer
+    precedence "=" = 0
     precedence "+" = 1
     precedence "-" = 1
     precedence "*" = 2
@@ -250,22 +234,27 @@ eoe = eof <|> void (lookAhead (char TokParenClose)) <?> "An end of expression wh
 expression :: SExpr -> Parser [SToken] SExpr
 expression PlaceHolder = consumeOne >>= f
   where
-    f (TokNum n)   = expression (Number n)
-    f (TokOp op)   = expression (UnaryOp op PlaceHolder)
+    f (TokNum n) = expression (Number n)
+    f (TokIdentifier n) = expression (Identifier n)
+    f (TokOp op) = expression (UnaryOp op PlaceHolder)
     f TokParenOpen = expression (Paren PlaceHolder)
     f t = parseError $ "Token " ++ show t ++ " can't be at start of an expression"
 expression (Paren PlaceHolder) = do
   s <- Paren <$> expression PlaceHolder
-  char TokParenClose <|> parseError "Closing parenthesis not found"
+  void (char TokParenClose) <|> parseError "Closing parenthesis not found"
   expression s
 expression (UnaryOp op PlaceHolder) = (consumeOne >>= f) <?> ("Unary operation " ++ op ++ " is missing his right hand side")
   where
     f (TokNum n) = expression (UnaryOp op (Number n))
+    f (TokIdentifier n) = expression (UnaryOp op (Identifier n))
     f TokParenOpen = UnaryOp op <$> expression (Paren PlaceHolder)
     f _ = empty
+expression (Biop "=" t@(Identifier _) PlaceHolder) = (Biop "=" t <$> expression PlaceHolder) <?> "Assignement is missing his right hand side"
+expression (Biop "=" _ PlaceHolder) =  parseError "Assignement should have an identifier as rhs"
 expression (Biop op a PlaceHolder) = (consumeOne >>= f) <?> ("Binary operation " ++ op ++ " is missing his right hand side")
   where
     f (TokNum n) = expression (Biop op a (Number n))
+    f (TokIdentifier n) = expression (Biop op a (Identifier n))
     f TokParenOpen = Biop op a <$> expression (Paren PlaceHolder)
     f _ = empty
 expression bop@(Biop op a b) = (consumeOne >>= f) <|> (eoe >> return bop)
@@ -286,21 +275,32 @@ toAst = expression PlaceHolder <* eof
 
 newtype EvalError = EvalError {runEvalError :: [String]} deriving (Show)
 
-eval :: SExpr -> Either EvalError Int
-eval (Number n) = Right n
+type EvalT a = StateT (Map String Integer) (Either EvalError) a
+
+evalError :: String -> EvalT a
+evalError = lift . Left . EvalError . (:[])
+
+eval :: SExpr -> EvalT Integer
+eval (Number n) = lift $ Right n
+eval (Identifier s) = get >>= maybe (evalError $ "Identifier " ++ s ++ " not found") return . Map.lookup s
 eval (Paren (eval -> n)) = n
-eval (UnaryOp "-" n) = eval n >>= Right . negate
-eval (UnaryOp op _) = Left . EvalError $ ["Unknown unary operator " ++ op]
+eval (UnaryOp "-" n) = negate <$> eval n
+eval (UnaryOp op _) = evalError $ "Unknown unary operator " ++ op
+eval (Biop "=" (Identifier lhs) (eval -> rhs)) = rhs >>= (\x -> modify (Map.insert lhs x) >> return x)
+eval (Biop "=" lhs _) = evalError $ "Lhs of assignement have to be an identifier, found " ++ show lhs
 eval (Biop "+" (eval -> lhs) (eval -> rhs)) = liftM2 (+) lhs rhs
 eval (Biop "-" (eval -> lhs) (eval -> rhs)) = liftM2 (-) lhs rhs
 eval (Biop "*" (eval -> lhs) (eval -> rhs)) = liftM2 (*) lhs rhs
-eval (Biop "/" (eval -> lhs) (eval -> rhs)) = join $ liftM2 safe_div lhs rhs
+eval (Biop "/" (eval -> lhs) (eval -> rhs)) = do
+    a <- lhs
+    b <- rhs
+    lift $ a `safe_div` b
   where
     safe_div _ 0 = Left . EvalError $ ["Division by 0 !"]
     safe_div a b = Right $ a `div` b
 eval (Biop "^" (eval -> lhs) (eval -> rhs)) = liftM2 (^) lhs rhs
-eval (Biop op _ _) = Left . EvalError $ ["Unknown binary operator " ++ op]
-eval PlaceHolder = Right 0
+eval (Biop op _ _) = lift .Left . EvalError $ ["Unknown binary operator " ++ op]
+eval PlaceHolder = return 0
 
 printError :: String -> Either [String] b -> MaybeT IO b
 printError s (Left msgs) = lift (putStrLn ("Error during " ++ s ++ ":") >> foldMap (putStrLn . color Yellow) msgs) >> hoistMaybe Nothing
@@ -312,14 +312,43 @@ printTokenError = printError "tokenizer" . first runParseError
 printAstError :: Either ParseError SExpr -> MaybeT IO SExpr
 printAstError = printError "AST generation" . first runParseError
 
-printEvalError :: Either EvalError Int -> MaybeT IO Int
+printEvalError :: Either EvalError a -> MaybeT IO a
 printEvalError = printError "Evaluation" . first runEvalError
 
-runAndEval :: String -> IO (Maybe Int)
-runAndEval s = runMaybeT $ do
-  tokens <- printTokenError $ runParser toTokens s
+runAndEval :: Map String Integer -> String -> IO (Map String Integer)
+runAndEval m s = runMaybeT (do
+  t <- printTokenError $ runParser toTokens s
+
+  (tokens, debugKind) <- return $ getDebugInfo t
+  when (debugKind == 'h') (lift printHelp >> hoistMaybe Nothing)
+  when (debugKind == 'm') (lift (print m) >> hoistMaybe Nothing)
+  when (debugKind == 't') (lift (print tokens) >> hoistMaybe Nothing)
+
   ast <- printAstError $ runParser toAst tokens
-  printEvalError $ eval ast
+  when (debugKind == 'a') (lift (print ast) >> hoistMaybe Nothing)
+
+  (e', m') <- printEvalError $ runStateT (eval ast) m
+  lift $ print e'
+  return m'
+  ) >>= maybe (return m) return
+
+printHelp :: IO ()
+printHelp =putStr $ unlines [
+          "This program can evaluate some simple expression",
+          "Only integer number are supported",
+          "The supported operations are +,-,/,^",
+          "You can also assignate values to variables, using the syntax `variable = value` ",
+          "Debug features:",
+          "You can show some internal structures by providing a debug flag",
+          "such debug flag is ':c' where c is a character which will dictate the kind of debug",
+          ":a to see ast, :t to see the tokens, :h to print this help, :m to see the stored variables values"
+          ]
+
+getDebugInfo :: [SToken] -> ([SToken], Char)
+getDebugInfo (TokDebug d:xs) = (xs, d)
+getDebugInfo t = (t, 'k')
+
+-- Interaction with "outside"
 
 data Color = Black | Red | Green | Yellow | Blue | Magenta | Cyan | White | Reset
 
@@ -341,20 +370,16 @@ color :: Color -> String -> String
 color (colorToEscapeCode -> e) s = e ++ s ++ colorToEscapeCode Reset
 
 repl :: IO ()
-repl = repl' 1
+repl = repl' (Map.empty :: Map String Integer)
   where
-    repl' k = do
+    repl' m = do
       maybeLine <- readline ">>> "
       case maybeLine of
         Nothing -> return () -- EOF / control-d
         Just line -> do
           addHistory line
-          val <- runAndEval line
-          maybe
-            (return ())
-            (\x -> putStrLn $ show k ++ ": " ++ show x)
-            val
-          repl' (k + 1)
+          m' <- runAndEval m line
+          repl' m'
 
 main :: IO ()
 main = repl
