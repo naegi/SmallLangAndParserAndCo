@@ -25,15 +25,17 @@ executable lang-test
     main-is:          Main.hs
 
     -- Modules included in this executable, other than Main.
-    -- other-modules:
+    other-modules:
+        Parser,
+        Lang
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
-    build-depends:   
+    build-depends:
         base ^>=4.14.3.0,
         containers,
         transformers ^>=0.6.0.2,
         readline ^>=1.0.3.0
-                      
+
     hs-source-dirs:   app
     default-language: Haskell2010
